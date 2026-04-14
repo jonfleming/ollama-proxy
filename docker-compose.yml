@@ -1,0 +1,38 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  hindsight:
+    image: ${HINDSIGHT_IMAGE:-ghcr.io/hindsight-ai/hindsight:latest}
+    container_name: hindsight
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+
+  proxy:
+    build:
+      context: .
+    container_name: ollama-proxy
+    env_file:
+      - .env
+    environment:
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      HINDSIGHT_HOST: ${HINDSIGHT_HOST:-http://hindsight:8000}
+      PROXY_PORT: ${PROXY_PORT:-8000}
+      HINDSIGHT_MAX_MEMORIES: ${HINDSIGHT_MAX_MEMORIES:-5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${PROXY_PORT:-8000}:8000"
+    depends_on:
+      - ollama
+      - hindsight
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
