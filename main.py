@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from memory_manager import MemoryManager
+from voice_router import VoiceRouter, VoiceRouterConfig, configure_default_router
 
 load_dotenv()
 
@@ -26,17 +27,53 @@ HINDSIGHT_HOST = os.getenv("HINDSIGHT_HOST", "http://100.111.132.40:8888").rstri
 PROXY_PORT = int(os.getenv("PROXY_PORT", "8000"))
 HINDSIGHT_MAX_MEMORIES = int(os.getenv("HINDSIGHT_MAX_MEMORIES", "5"))
 HINDSIGHT_BANK = os.getenv("HINDSIGHT_BANK", "amicus-2026")
+VOICE_CLASSIFIER_MODEL = os.getenv("VOICE_CLASSIFIER_MODEL", "phi3-mini")
+VOICE_RESPONSE_MODEL = os.getenv("VOICE_RESPONSE_MODEL", "llama3")
+VOICE_CLASSIFIER_TIMEOUT_SECONDS = float(os.getenv("VOICE_CLASSIFIER_TIMEOUT_SECONDS", "1.2"))
+VOICE_CONTEXT_TIMEOUT_SECONDS = float(os.getenv("VOICE_CONTEXT_TIMEOUT_SECONDS", "3.5"))
+VOICE_BUFFER_PHRASE = os.getenv("VOICE_BUFFER_PHRASE", "Let me check...")
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    async def piper_stream_chunk(chunk: str) -> None:
+        # Hook this to your Piper async streaming sink.
+        LOGGER.debug("Piper chunk: %s", chunk)
+
+    async def piper_play_phrase(text: str) -> None:
+        # Hook this to your Piper one-shot/non-blocking phrase playback.
+        LOGGER.info("Piper buffer phrase: %s", text)
+
+    async def piper_stop_playback() -> None:
+        # Hook this to Piper cancellation if supported.
+        LOGGER.debug("Piper stop playback requested")
+
+    async def get_memory_context(query: str) -> str:
+        return await app.state.memory_manager.build_context_block(query)
+
     app.state.http = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
     app.state.memory_manager = MemoryManager(
         host=HINDSIGHT_HOST,
         bank=HINDSIGHT_BANK,
         max_memories=HINDSIGHT_MAX_MEMORIES,
     )
+    app.state.voice_router = VoiceRouter(
+        http_client=app.state.http,
+        config=VoiceRouterConfig(
+            ollama_base_url=OLLAMA_BASE_URL,
+            classifier_model=VOICE_CLASSIFIER_MODEL,
+            response_model=VOICE_RESPONSE_MODEL,
+            classifier_timeout_seconds=VOICE_CLASSIFIER_TIMEOUT_SECONDS,
+            context_timeout_seconds=VOICE_CONTEXT_TIMEOUT_SECONDS,
+            buffer_phrase=VOICE_BUFFER_PHRASE,
+        ),
+        get_memory=get_memory_context,
+        piper_stream_chunk=piper_stream_chunk,
+        piper_play_phrase=piper_play_phrase,
+        piper_stop_playback=piper_stop_playback,
+    )
+    configure_default_router(app.state.voice_router)
     LOGGER.info("Proxy starting with Ollama at %s", OLLAMA_BASE_URL)
     try:
         yield
@@ -306,6 +343,25 @@ async def api_generate(request: Request) -> Response:
 @app.post("/api/chat")
 async def api_chat(request: Request) -> Response:
     return await proxy_generation_request(request, endpoint="chat")
+
+
+@app.post("/api/voice/handle")
+async def api_voice_handle(request: Request) -> Response:
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON payload"})
+
+    transcription = _normalize_content(payload.get("transcription"))
+    if not transcription:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing 'transcription' in request body"},
+        )
+
+    router: VoiceRouter = request.app.state.voice_router
+    result = await router.handle_voice_input(transcription)
+    return JSONResponse(status_code=200, content=result)
 
 
 if __name__ == "__main__":
