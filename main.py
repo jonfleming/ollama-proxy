@@ -27,7 +27,7 @@ HINDSIGHT_HOST = os.getenv("HINDSIGHT_HOST", "http://100.111.132.40:8888").rstri
 PROXY_PORT = int(os.getenv("PROXY_PORT", "8000"))
 HINDSIGHT_MAX_MEMORIES = int(os.getenv("HINDSIGHT_MAX_MEMORIES", "5"))
 HINDSIGHT_BANK = os.getenv("HINDSIGHT_BANK", "amicus-2026")
-VOICE_CLASSIFIER_MODEL = os.getenv("VOICE_CLASSIFIER_MODEL", "phi3-mini")
+VOICE_CLASSIFIER_MODEL = os.getenv("VOICE_CLASSIFIER_MODEL", "llama3.2:1b")
 VOICE_RESPONSE_MODEL = os.getenv("VOICE_RESPONSE_MODEL", "llama3")
 VOICE_CLASSIFIER_TIMEOUT_SECONDS = float(os.getenv("VOICE_CLASSIFIER_TIMEOUT_SECONDS", "1.2"))
 VOICE_CONTEXT_TIMEOUT_SECONDS = float(os.getenv("VOICE_CONTEXT_TIMEOUT_SECONDS", "3.5"))
@@ -257,7 +257,34 @@ async def proxy_generation_request(request: Request, endpoint: str) -> Response:
         return JSONResponse(status_code=400, content={"error": "Invalid JSON payload"})
 
     user_query = extract_user_query(payload, endpoint)
-    context_block = await memory_manager.build_context_block(user_query) if user_query else ""
+    context_block = ""
+
+    # Use the fast classifier to decide whether to run recall.
+    router: VoiceRouter | None = getattr(request.app.state, "voice_router", None)
+    if user_query and router is not None:
+        try:
+            classification = await router.quick_classify(user_query)
+        except Exception as exc:
+            LOGGER.warning("Classifier failed, falling back to SIMPLE: %s", exc)
+            classification = "SIMPLE"
+
+        if classification == "COMPLEX":
+            try:
+                # Bound recall time so requests aren't held up indefinitely.
+                async with asyncio.timeout(router.config.context_timeout_seconds):
+                    context_block = await memory_manager.build_context_block(user_query)
+            except Exception as exc:
+                LOGGER.warning("Context retrieval failed: %s", exc)
+                context_block = ""
+    elif user_query:
+        # No router available (legacy) — attempt recall but bound by env timeout.
+        try:
+            async with asyncio.timeout(VOICE_CONTEXT_TIMEOUT_SECONDS):
+                context_block = await memory_manager.build_context_block(user_query)
+        except Exception as exc:
+            LOGGER.warning("Context retrieval failed (no router): %s", exc)
+            context_block = ""
+
     outgoing_payload = inject_context(payload, endpoint, context_block) if context_block else payload
     upstream_url = f"{OLLAMA_BASE_URL}/api/{endpoint}"
 

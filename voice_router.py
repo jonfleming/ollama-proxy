@@ -12,7 +12,8 @@ import httpx
 LOGGER = logging.getLogger("ollama_proxy.voice_router")
 
 CLASSIFIER_SIMPLE = "SIMPLE"
-CLASSIFIER_COMPLEX = "COMPLEX"
+CLASSIFIER_COMPLEX_PERSONAL = "COMPLEX_PERSONAL"
+CLASSIFIER_COMPLEX_GENERAL = "COMPLEX_GENERAL"
 QUESTION_WORDS = {
     "what",
     "when",
@@ -50,8 +51,8 @@ async def _noop_stop_playback() -> None:
 @dataclass(slots=True)
 class VoiceRouterConfig:
     ollama_base_url: str
-    classifier_model: str = "phi3-mini"
-    response_model: str = "llama3"
+    classifier_model: str = "llama3.2:1b"
+    response_model: str = "gemma4:latest"
     classifier_timeout_seconds: float = 1.2
     context_timeout_seconds: float = 3.5
     buffer_phrase: str = "Let me check..."
@@ -80,10 +81,13 @@ class VoiceRouter:
         words = [word for word in re.split(r"\s+", stripped) if word]
         if len(words) <= 3:
             return CLASSIFIER_SIMPLE
-        if "?" in stripped:
-            return CLASSIFIER_COMPLEX
-        if any(word in QUESTION_WORDS for word in words):
-            return CLASSIFIER_COMPLEX
+        # If the user mentions themselves or uses first-person pronouns,
+        # treat this as a personal/relational question where recall may help.
+        personal_markers = {"my", "mine", "me", "i", "we", "our", "us", "ours"}
+        if any(word in personal_markers for word in words):
+            return CLASSIFIER_COMPLEX_PERSONAL
+        if "?" in stripped or any(word in QUESTION_WORDS for word in words):
+            return CLASSIFIER_COMPLEX_GENERAL
         return CLASSIFIER_SIMPLE
 
     async def quick_classify(self, text: str) -> str:
@@ -94,9 +98,10 @@ class VoiceRouter:
 
         prompt = (
             "Classify the user utterance for voice-routing. "
-            "Reply with exactly one word: SIMPLE or COMPLEX.\n\n"
+            "Reply with exactly one word: SIMPLE, COMPLEX_PERSONAL, or COMPLEX_GENERAL.\n\n"
             "SIMPLE: greetings, acknowledgements, or short chit-chat that needs no retrieval.\n"
-            "COMPLEX: requests that likely need facts, memory, or retrieval.\n\n"
+            "COMPLEX_PERSONAL: questions about the user or their relationships/work that may need personal memory.\n"
+            "COMPLEX_GENERAL: general knowledge or factual questions that don't require recalling personal memory.\n\n"
             f"Utterance: {normalized}\n"
             "Answer:"
         )
@@ -106,20 +111,47 @@ class VoiceRouter:
             "stream": False,
             "options": {"temperature": 0},
         }
-
         started = time.perf_counter()
         try:
             async with asyncio.timeout(self.config.classifier_timeout_seconds):
+                LOGGER.debug("Classifier payload: %s", payload)
                 response = await self.http_client.post(
                     f"{self.config.ollama_base_url}/api/generate",
                     json=payload,
+                    headers={"Content-Type": "application/json"},
                 )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except Exception:
+                # Log response body to help diagnose 4xx/5xx from Ollama
+                text = None
+                try:
+                    text = response.text
+                except Exception:
+                    text = "<could not read response body>"
+                LOGGER.warning(
+                    "Classifier request returned status=%s body=%s",
+                    response.status_code,
+                    text,
+                )
+                raise
+
             data = response.json()
-            raw = str(data.get("response", "")).strip().upper()
-            token = raw.split()[0] if raw else ""
-            if token not in {CLASSIFIER_SIMPLE, CLASSIFIER_COMPLEX}:
+            raw = str(data.get("response", "")).strip()
+            # Accept several token formats and be robust to casing/noise.
+            m = re.search(r"\b(SIMPLE|COMPLEX_PERSONAL|COMPLEX_GENERAL|COMPLEX)\b", raw, re.IGNORECASE)
+            if not m:
                 raise ValueError(f"Invalid classifier token: {raw}")
+            tok = m.group(1).upper()
+            if tok == "SIMPLE":
+                token = CLASSIFIER_SIMPLE
+            elif tok == "COMPLEX":
+                # Backwards compatibility: treat plain COMPLEX as GENERAL.
+                token = CLASSIFIER_COMPLEX_GENERAL
+            elif tok == "COMPLEX_PERSONAL":
+                token = CLASSIFIER_COMPLEX_PERSONAL
+            elif tok == "COMPLEX_GENERAL":
+                token = CLASSIFIER_COMPLEX_GENERAL
             elapsed = (time.perf_counter() - started) * 1000
             LOGGER.info("Classification decision: %s (%.1fms)", token, elapsed)
             return token
@@ -220,8 +252,9 @@ class VoiceRouter:
         total_started = time.perf_counter()
         classification = await self.quick_classify(transcription)
 
-        if classification == CLASSIFIER_SIMPLE:
+        if classification == CLASSIFIER_SIMPLE or classification == CLASSIFIER_COMPLEX_GENERAL:
             LOGGER.info("Routing path: FAST")
+            # For general knowledge (COMPLEX_GENERAL) we do not fetch personal context.
             response_text = await self.stream_ollama_to_piper(prompt=transcription, context=None)
             total_elapsed = (time.perf_counter() - total_started) * 1000
             LOGGER.info("Voice pipeline complete path=FAST total=%.1fms", total_elapsed)

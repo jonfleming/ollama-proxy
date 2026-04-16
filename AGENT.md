@@ -16,7 +16,7 @@ This repository provides a FastAPI middleware proxy between Home Assistant voice
     - Hindsight client operations currently use `recall(...)` for retrieval and `retain(...)` for storage.
 3. Voice routing pipeline (Fast Path vs Deep Path):
     - Implemented in `voice_router.py`.
-    - Uses a small classifier model (default `phi3-mini`) to return `SIMPLE` or `COMPLEX`.
+    - Uses a small classifier model (default `llama3.2:1b`) to return `SIMPLE` or `COMPLEX`.
     - Fallback heuristic on failure/timeout:
       - `len(text.split()) <= 3` => `SIMPLE`
       - question words or `?` => `COMPLEX`
@@ -44,7 +44,7 @@ Core:
 - `LOG_LEVEL`
 
 Voice routing:
-- `VOICE_CLASSIFIER_MODEL` (default `phi3-mini`)
+- `VOICE_CLASSIFIER_MODEL` (default `llama3.2:1b`)
 - `VOICE_RESPONSE_MODEL` (default `llama3`)
 - `VOICE_CLASSIFIER_TIMEOUT_SECONDS` (default `1.2`)
 - `VOICE_CONTEXT_TIMEOUT_SECONDS` (default `3.5`)
