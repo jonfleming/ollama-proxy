@@ -204,6 +204,49 @@ async def passthrough_post(request: Request, upstream_path: str) -> Response:
         )
 
 
+async def passthrough_post_streaming(request: Request, upstream_path: str) -> Response:
+    http_client: httpx.AsyncClient = request.app.state.http
+    upstream_url = f"{OLLAMA_BASE_URL}{upstream_path}"
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        payload = {}
+
+    try:
+        upstream_request = http_client.build_request("POST", upstream_url, json=payload)
+        upstream_response = await http_client.send(upstream_request, stream=True)
+    except httpx.HTTPError as exc:
+        LOGGER.exception("Failed streaming POST passthrough to %s", upstream_url)
+        return JSONResponse(
+            status_code=502,
+            content={"error": "Unable to reach Ollama", "details": str(exc)},
+        )
+
+    if upstream_response.status_code >= 400:
+        error_body = await upstream_response.aread()
+        await upstream_response.aclose()
+        return Response(
+            content=error_body,
+            status_code=upstream_response.status_code,
+            media_type=upstream_response.headers.get("content-type", "application/json"),
+        )
+
+    async def raw_stream() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in upstream_response.aiter_raw():
+                if chunk:
+                    yield chunk
+        finally:
+            await upstream_response.aclose()
+
+    return StreamingResponse(
+        raw_stream(),
+        status_code=upstream_response.status_code,
+        media_type=upstream_response.headers.get("content-type", "application/x-ndjson"),
+    )
+
+
 async def proxy_generation_request(request: Request, endpoint: str) -> Response:
     http_client: httpx.AsyncClient = request.app.state.http
     memory_manager: MemoryManager = request.app.state.memory_manager
@@ -333,6 +376,11 @@ async def api_tags(request: Request) -> Response:
 @app.post("/api/show")
 async def api_show(request: Request) -> Response:
     return await passthrough_post(request, "/api/show")
+
+
+@app.post("/api/pull")
+async def api_pull(request: Request) -> Response:
+    return await passthrough_post_streaming(request, "/api/pull")
 
 
 @app.post("/api/generate")
