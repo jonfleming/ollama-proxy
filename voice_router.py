@@ -55,6 +55,9 @@ class VoiceRouterConfig:
     classifier_model: str = "llama3.2:1b"
     response_model: str = "gemma4:latest"
     classifier_timeout_seconds: float = 1.2
+    classifier_only_on_personal_hint: bool = True
+    classifier_timeout_streak_breaker: int = 2
+    classifier_breaker_cooldown_seconds: float = 30.0
     context_timeout_seconds: float = 3.5
     buffer_phrase: str = "Let me check..."
 
@@ -76,6 +79,8 @@ class VoiceRouter:
         self.piper_stream_chunk = piper_stream_chunk
         self.piper_play_phrase = piper_play_phrase
         self.piper_stop_playback = piper_stop_playback
+        self._classifier_timeout_streak = 0
+        self._classifier_breaker_until = 0.0
 
     def _classifier_fallback(self, text: str) -> str:
         stripped = text.strip().lower()
@@ -96,6 +101,28 @@ class VoiceRouter:
         if not normalized:
             LOGGER.info("Classification decision: SIMPLE (empty input)")
             return CLASSIFIER_SIMPLE
+
+        fallback = self._classifier_fallback(normalized)
+
+        now = time.monotonic()
+        if now < self._classifier_breaker_until:
+            remaining = self._classifier_breaker_until - now
+            LOGGER.info(
+                "Classifier breaker open for %.1fs, using fallback=%s",
+                remaining,
+                fallback,
+            )
+            return fallback
+
+        if (
+            self.config.classifier_only_on_personal_hint
+            and fallback in {CLASSIFIER_SIMPLE, CLASSIFIER_COMPLEX_GENERAL}
+        ):
+            LOGGER.info(
+                "Classification heuristic short-circuit decision=%s",
+                fallback,
+            )
+            return fallback
 
         prompt = (
             "Classify the user utterance for voice-routing. "
@@ -166,12 +193,20 @@ class VoiceRouter:
                 token = CLASSIFIER_COMPLEX_PERSONAL
             elif tok == "COMPLEX_GENERAL":
                 token = CLASSIFIER_COMPLEX_GENERAL
+            self._classifier_timeout_streak = 0
             elapsed = (time.perf_counter() - started) * 1000
             LOGGER.info("Classification decision: %s (%.1fms)", token, elapsed)
             return token
         except TimeoutError as exc:
-            fallback = self._classifier_fallback(normalized)
             elapsed = (time.perf_counter() - started) * 1000
+            self._classifier_timeout_streak += 1
+            if self._classifier_timeout_streak >= self.config.classifier_timeout_streak_breaker:
+                self._classifier_breaker_until = time.monotonic() + self.config.classifier_breaker_cooldown_seconds
+                LOGGER.warning(
+                    "Classifier breaker opened streak=%d cooldown=%.1fs",
+                    self._classifier_timeout_streak,
+                    self.config.classifier_breaker_cooldown_seconds,
+                )
             LOGGER.warning(
                 "Classifier timeout model=%s url=%s timeout=%.2fs fallback=%s elapsed=%.1fms exc=%s",
                 self.config.classifier_model,
@@ -184,8 +219,8 @@ class VoiceRouter:
             LOGGER.debug("Classifier timeout traceback:\n%s", traceback.format_exc())
             return fallback
         except httpx.HTTPError as exc:
-            fallback = self._classifier_fallback(normalized)
             elapsed = (time.perf_counter() - started) * 1000
+            self._classifier_timeout_streak = 0
             LOGGER.warning(
                 "Classifier HTTP error model=%s url=%s fallback=%s elapsed=%.1fms error=%s",
                 self.config.classifier_model,
@@ -196,8 +231,8 @@ class VoiceRouter:
             )
             return fallback
         except Exception as exc:
-            fallback = self._classifier_fallback(normalized)
             elapsed = (time.perf_counter() - started) * 1000
+            self._classifier_timeout_streak = 0
             LOGGER.warning(
                 "Classifier failed model=%s fallback=%s elapsed=%.1fms error=%s",
                 self.config.classifier_model,

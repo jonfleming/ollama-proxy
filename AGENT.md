@@ -49,6 +49,9 @@ Voice routing:
 - `VOICE_CLASSIFIER_MODEL` (default `llama3.2:1b`)
 - `VOICE_RESPONSE_MODEL` (default `llama3`)
 - `VOICE_CLASSIFIER_TIMEOUT_SECONDS` (default `1.2`)
+- `VOICE_CLASSIFIER_ONLY_ON_PERSONAL_HINT` (default `true`; short-circuits obvious SIMPLE/COMPLEX_GENERAL without LLM classifier call)
+- `VOICE_CLASSIFIER_TIMEOUT_STREAK_BREAKER` (default `2`; open breaker after this many timeout failures)
+- `VOICE_CLASSIFIER_BREAKER_COOLDOWN_SECONDS` (default `30.0`; cooldown while classifier calls are skipped)
 - `VOICE_CONTEXT_TIMEOUT_SECONDS` (default `3.5`)
 - `VOICE_BUFFER_PHRASE` (default `Let me check...`)
 

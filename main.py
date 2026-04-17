@@ -32,6 +32,16 @@ HINDSIGHT_BANK = os.getenv("HINDSIGHT_BANK", "amicus-2026")
 VOICE_CLASSIFIER_MODEL = os.getenv("VOICE_CLASSIFIER_MODEL", "llama3.2:1b")
 VOICE_RESPONSE_MODEL = os.getenv("VOICE_RESPONSE_MODEL", "llama3")
 VOICE_CLASSIFIER_TIMEOUT_SECONDS = float(os.getenv("VOICE_CLASSIFIER_TIMEOUT_SECONDS", "1.2"))
+VOICE_CLASSIFIER_ONLY_ON_PERSONAL_HINT = (
+    os.getenv("VOICE_CLASSIFIER_ONLY_ON_PERSONAL_HINT", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+VOICE_CLASSIFIER_TIMEOUT_STREAK_BREAKER = int(
+    os.getenv("VOICE_CLASSIFIER_TIMEOUT_STREAK_BREAKER", "2")
+)
+VOICE_CLASSIFIER_BREAKER_COOLDOWN_SECONDS = float(
+    os.getenv("VOICE_CLASSIFIER_BREAKER_COOLDOWN_SECONDS", "30.0")
+)
 VOICE_CONTEXT_TIMEOUT_SECONDS = float(os.getenv("VOICE_CONTEXT_TIMEOUT_SECONDS", "3.5"))
 VOICE_BUFFER_PHRASE = os.getenv("VOICE_BUFFER_PHRASE", "Let me check...")
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
@@ -67,6 +77,9 @@ async def lifespan(app: FastAPI):
             classifier_model=VOICE_CLASSIFIER_MODEL,
             response_model=VOICE_RESPONSE_MODEL,
             classifier_timeout_seconds=VOICE_CLASSIFIER_TIMEOUT_SECONDS,
+            classifier_only_on_personal_hint=VOICE_CLASSIFIER_ONLY_ON_PERSONAL_HINT,
+            classifier_timeout_streak_breaker=VOICE_CLASSIFIER_TIMEOUT_STREAK_BREAKER,
+            classifier_breaker_cooldown_seconds=VOICE_CLASSIFIER_BREAKER_COOLDOWN_SECONDS,
             context_timeout_seconds=VOICE_CONTEXT_TIMEOUT_SECONDS,
             buffer_phrase=VOICE_BUFFER_PHRASE,
         ),
@@ -272,6 +285,7 @@ async def proxy_generation_request(request: Request, endpoint: str) -> Response:
         parse_elapsed,
     )
 
+    LOGGER.debug("Proxy request id=%s payload=%s", request_id, json.dumps(payload))
     user_query = extract_user_query(payload, endpoint)
     context_block = ""
 
@@ -293,7 +307,7 @@ async def proxy_generation_request(request: Request, endpoint: str) -> Response:
             classify_elapsed,
         )
 
-        if classification == "COMPLEX_PERSONAL":
+        if classification in ["COMPLEX_PERSONAL", "COMPLEX_GENERAL"]:
             context_started = time.perf_counter()
             try:
                 # Bound recall time so requests aren't held up indefinitely.
