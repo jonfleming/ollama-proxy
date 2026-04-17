@@ -32,6 +32,23 @@ class MemoryManager:
         self.bank = bank        
         self.client = Hindsight(base_url=self.host, timeout=self.timeout)
 
+    async def _close_client(self, client: Hindsight) -> None:
+        close_method = getattr(client, "aclose", None)
+        if close_method is not None:
+            result = close_method()
+            if inspect.isawaitable(result):
+                await result
+            return
+
+        close_method = getattr(client, "close", None)
+        if close_method is not None:
+            result = close_method()
+            if inspect.isawaitable(result):
+                await result
+
+    async def aclose(self) -> None:
+        await self._close_client(self.client)
+
     async def _call_hindsight(self, method_name: str, **kwargs: Any) -> Any:
         method = getattr(self.client, method_name)
         try:
@@ -49,11 +66,16 @@ class MemoryManager:
 
     def _call_hindsight_sync(self, method_name: str, kwargs: dict[str, Any]) -> Any:
         client = Hindsight(base_url=self.host, timeout=self.timeout)
-        method = getattr(client, method_name)
-        result = method(**kwargs)
-        if inspect.isawaitable(result):
-            return asyncio.run(result)
-        return result
+        try:
+            method = getattr(client, method_name)
+            result = method(**kwargs)
+            if inspect.isawaitable(result):
+                return asyncio.run(result)
+            return result
+        finally:
+            close_method = getattr(client, "close", None)
+            if close_method is not None:
+                close_method()
 
     async def retrieve_memories(self, query: str, budget: int | None = None) -> list[str]:
         if not query:
@@ -99,9 +121,9 @@ class MemoryManager:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": "conversation"
         }
+        client = Hindsight(base_url=self.host, timeout=10.0)
         try:
             # Use a longer timeout for retention since it's best-effort
-            client = Hindsight(base_url=self.host, timeout=10.0)
             await client.aretain(
                 bank_id=self.bank,
                 content=memory_text,
@@ -115,3 +137,5 @@ class MemoryManager:
         except Exception as e:
             LOGGER.debug(f"Hindsight retain failed: {e}")
             return False
+        finally:
+            await self._close_client(client)

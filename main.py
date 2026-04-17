@@ -3,6 +3,8 @@ import copy
 import json
 import logging
 import os
+import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
@@ -78,6 +80,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await app.state.memory_manager.aclose()
         await app.state.http.aclose()
 
 
@@ -250,11 +253,24 @@ async def passthrough_post_streaming(request: Request, upstream_path: str) -> Re
 async def proxy_generation_request(request: Request, endpoint: str) -> Response:
     http_client: httpx.AsyncClient = request.app.state.http
     memory_manager: MemoryManager = request.app.state.memory_manager
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:8]
+    request_started = time.perf_counter()
 
+    parse_started = time.perf_counter()
     try:
         payload = await request.json()
     except json.JSONDecodeError:
         return JSONResponse(status_code=400, content={"error": "Invalid JSON payload"})
+    parse_elapsed = (time.perf_counter() - parse_started) * 1000
+
+    stream = bool(payload.get("stream", False))
+    LOGGER.info(
+        "Proxy request id=%s endpoint=%s stream=%s parse=%.1fms",
+        request_id,
+        endpoint,
+        stream,
+        parse_elapsed,
+    )
 
     user_query = extract_user_query(payload, endpoint)
     context_block = ""
@@ -262,13 +278,23 @@ async def proxy_generation_request(request: Request, endpoint: str) -> Response:
     # Use the fast classifier to decide whether to run recall.
     router: VoiceRouter | None = getattr(request.app.state, "voice_router", None)
     if user_query and router is not None:
+        classify_started = time.perf_counter()
         try:
             classification = await router.quick_classify(user_query)
         except Exception as exc:
             LOGGER.warning("Classifier failed, falling back to SIMPLE: %s", exc)
             classification = "SIMPLE"
+        classify_elapsed = (time.perf_counter() - classify_started) * 1000
+        LOGGER.info(
+            "Proxy classification id=%s result=%s query_chars=%d in %.1fms",
+            request_id,
+            classification,
+            len(user_query),
+            classify_elapsed,
+        )
 
-        if classification == "COMPLEX":
+        if classification == "COMPLEX_PERSONAL":
+            context_started = time.perf_counter()
             try:
                 # Bound recall time so requests aren't held up indefinitely.
                 async with asyncio.timeout(router.config.context_timeout_seconds):
@@ -276,19 +302,52 @@ async def proxy_generation_request(request: Request, endpoint: str) -> Response:
             except Exception as exc:
                 LOGGER.warning("Context retrieval failed: %s", exc)
                 context_block = ""
+            context_elapsed = (time.perf_counter() - context_started) * 1000
+            LOGGER.info(
+                "Proxy context id=%s used=%s chars=%d in %.1fms",
+                request_id,
+                bool(context_block),
+                len(context_block),
+                context_elapsed,
+            )
+        else:
+            LOGGER.info(
+                "Proxy context id=%s skipped_for_classification=%s",
+                request_id,
+                classification,
+            )
     elif user_query:
         # No router available (legacy) — attempt recall but bound by env timeout.
+        context_started = time.perf_counter()
         try:
             async with asyncio.timeout(VOICE_CONTEXT_TIMEOUT_SECONDS):
                 context_block = await memory_manager.build_context_block(user_query)
         except Exception as exc:
             LOGGER.warning("Context retrieval failed (no router): %s", exc)
             context_block = ""
+        context_elapsed = (time.perf_counter() - context_started) * 1000
+        LOGGER.info(
+            "Proxy context id=%s legacy_router_path used=%s chars=%d in %.1fms",
+            request_id,
+            bool(context_block),
+            len(context_block),
+            context_elapsed,
+        )
+    else:
+        LOGGER.info("Proxy request id=%s has_no_user_query", request_id)
 
     outgoing_payload = inject_context(payload, endpoint, context_block) if context_block else payload
     upstream_url = f"{OLLAMA_BASE_URL}/api/{endpoint}"
+    LOGGER.info(
+        "Proxy upstream start id=%s endpoint=%s stream=%s context_injected=%s",
+        request_id,
+        endpoint,
+        stream,
+        bool(context_block),
+    )
 
-    if bool(payload.get("stream", False)):
+    if stream:
+        upstream_started = time.perf_counter()
         try:
             upstream_request = http_client.build_request("POST", upstream_url, json=outgoing_payload)
             upstream_response = await http_client.send(upstream_request, stream=True)
@@ -298,6 +357,14 @@ async def proxy_generation_request(request: Request, endpoint: str) -> Response:
                 status_code=502,
                 content={"error": "Unable to reach Ollama", "details": str(exc)},
             )
+
+        upstream_elapsed = (time.perf_counter() - upstream_started) * 1000
+        LOGGER.info(
+            "Proxy upstream accepted id=%s status=%s in %.1fms",
+            request_id,
+            upstream_response.status_code,
+            upstream_elapsed,
+        )
 
         if upstream_response.status_code >= 400:
             error_body = await upstream_response.aread()
@@ -310,10 +377,20 @@ async def proxy_generation_request(request: Request, endpoint: str) -> Response:
 
         async def line_stream() -> AsyncIterator[bytes]:
             collected_chunks: list[str] = []
+            chunk_count = 0
+            first_chunk_ms: float | None = None
             try:
                 async for line in upstream_response.aiter_lines():
                     if not line:
                         continue
+                    chunk_count += 1
+                    if first_chunk_ms is None:
+                        first_chunk_ms = (time.perf_counter() - request_started) * 1000
+                        LOGGER.info(
+                            "Proxy first stream line id=%s at %.1fms",
+                            request_id,
+                            first_chunk_ms,
+                        )
                     try:
                         decoded = json.loads(line)
                         chunk = extract_assistant_text(decoded, endpoint)
@@ -324,6 +401,14 @@ async def proxy_generation_request(request: Request, endpoint: str) -> Response:
                     yield f"{line}\n".encode("utf-8")
             finally:
                 await upstream_response.aclose()
+                total_elapsed = (time.perf_counter() - request_started) * 1000
+                LOGGER.info(
+                    "Proxy stream complete id=%s lines=%d chars=%d total=%.1fms",
+                    request_id,
+                    chunk_count,
+                    sum(len(c) for c in collected_chunks),
+                    total_elapsed,
+                )
                 if user_query and collected_chunks:
                     asyncio.create_task(
                         store_interaction_if_possible(
@@ -339,6 +424,7 @@ async def proxy_generation_request(request: Request, endpoint: str) -> Response:
             media_type=upstream_response.headers.get("content-type", "application/x-ndjson"),
         )
 
+    upstream_started = time.perf_counter()
     try:
         upstream_response = await http_client.post(upstream_url, json=outgoing_payload)
     except httpx.HTTPError as exc:
@@ -347,6 +433,13 @@ async def proxy_generation_request(request: Request, endpoint: str) -> Response:
             status_code=502,
             content={"error": "Unable to reach Ollama", "details": str(exc)},
         )
+    upstream_elapsed = (time.perf_counter() - upstream_started) * 1000
+    LOGGER.info(
+        "Proxy upstream done id=%s status=%s in %.1fms",
+        request_id,
+        upstream_response.status_code,
+        upstream_elapsed,
+    )
 
     if upstream_response.status_code >= 400:
         return Response(
@@ -363,6 +456,15 @@ async def proxy_generation_request(request: Request, endpoint: str) -> Response:
     assistant_text = extract_assistant_text(response_payload, endpoint)
     if user_query and assistant_text:
         asyncio.create_task(store_interaction_if_possible(request, user_query, assistant_text))
+
+    total_elapsed = (time.perf_counter() - request_started) * 1000
+    LOGGER.info(
+        "Proxy request complete id=%s endpoint=%s response_chars=%d total=%.1fms",
+        request_id,
+        endpoint,
+        len(assistant_text),
+        total_elapsed,
+    )
 
     return Response(
         content=upstream_response.content,

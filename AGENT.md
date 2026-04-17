@@ -16,12 +16,14 @@ This repository provides a FastAPI middleware proxy between Home Assistant voice
     - Hindsight client operations currently use `recall(...)` for retrieval and `retain(...)` for storage.
 3. Voice routing pipeline (Fast Path vs Deep Path):
     - Implemented in `voice_router.py`.
-    - Uses a small classifier model (default `llama3.2:1b`) to return `SIMPLE` or `COMPLEX`.
+        - Uses a small classifier model (default `llama3.2:1b`) to return `SIMPLE`, `COMPLEX_PERSONAL`, or `COMPLEX_GENERAL`.
     - Fallback heuristic on failure/timeout:
       - `len(text.split()) <= 3` => `SIMPLE`
-      - question words or `?` => `COMPLEX`
+            - first-person markers (`my`, `me`, `I`, etc.) => `COMPLEX_PERSONAL`
+            - question words or `?` => `COMPLEX_GENERAL`
     - `SIMPLE` path: direct Ollama streaming to Piper sink without memory lookup.
-    - `COMPLEX` path: buffer phrase playback and memory retrieval run concurrently, then response is streamed with optional context.
+        - `COMPLEX_GENERAL` path: direct Ollama streaming without memory lookup.
+        - `COMPLEX_PERSONAL` path: buffer phrase playback and memory retrieval run concurrently, then response is streamed with optional context.
 
 ## Important Files
 - `main.py`: app lifecycle, HTTP proxy behavior, memory injection, and `/api/voice/handle` endpoint.
@@ -70,21 +72,31 @@ These are stubs that log activity and should be replaced with real Piper playbac
 - If changing retrieval semantics, preserve graceful fallback to raw prompts.
 - If changing voice routing, keep classifier timeout + heuristic fallback to avoid latency spikes.
 - Add tests for routing decisions and stream forwarding whenever behavior changes.
+- Preserve explicit cleanup of `httpx` and `hindsight_client` clients to avoid unclosed `aiohttp` session/connector warnings.
 
 ## How to Test Quickly
 1. Start the service:
 
 ```bash
+source .venv/bin/activate
 python main.py
 ```
 
-2. Health check:
+2. Run tests:
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+3. Health check:
 
 ```bash
 curl -s http://127.0.0.1:8000/health | jq .
 ```
 
-3. Non-streaming chat proxy check:
+4. Non-streaming chat proxy check:
 
 ```bash
 curl -s http://127.0.0.1:8000/api/chat \
@@ -98,7 +110,7 @@ curl -s http://127.0.0.1:8000/api/chat \
     }' | jq .
 ```
 
-4. Streaming chat proxy check:
+5. Streaming chat proxy check:
 
 ```bash
 curl -N http://127.0.0.1:8000/api/chat \
@@ -112,7 +124,7 @@ curl -N http://127.0.0.1:8000/api/chat \
     }'
 ```
 
-5. Voice routing check (SIMPLE path candidate):
+6. Voice routing check (SIMPLE path candidate):
 
 ```bash
 curl -s http://127.0.0.1:8000/api/voice/handle \
@@ -120,7 +132,7 @@ curl -s http://127.0.0.1:8000/api/voice/handle \
     -d '{"transcription":"Hey there"}' | jq .
 ```
 
-6. Voice routing check (COMPLEX path candidate):
+7. Voice routing check (COMPLEX_PERSONAL path candidate):
 
 ```bash
 curl -s http://127.0.0.1:8000/api/voice/handle \
@@ -128,8 +140,8 @@ curl -s http://127.0.0.1:8000/api/voice/handle \
     -d '{"transcription":"What did I ask about my calendar yesterday?"}' | jq .
 ```
 
-7. Verify logs for latency and routing decisions:
-     - Look for classifier output (`SIMPLE` or `COMPLEX`).
+8. Verify logs for latency and routing decisions:
+    - Look for classifier output (`SIMPLE`, `COMPLEX_PERSONAL`, or `COMPLEX_GENERAL`).
      - Look for path logs (`FAST` or `DEEP`).
      - Confirm timing fields are reported in endpoint responses.
 

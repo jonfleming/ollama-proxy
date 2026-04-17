@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -112,14 +113,27 @@ class VoiceRouter:
             "options": {"temperature": 0},
         }
         started = time.perf_counter()
+        classifier_url = f"{self.config.ollama_base_url}/api/generate"
         try:
             async with asyncio.timeout(self.config.classifier_timeout_seconds):
-                LOGGER.debug("Classifier payload: %s", payload)
+                LOGGER.debug(
+                    "Classifier request model=%s timeout=%.2fs prompt_chars=%d",
+                    self.config.classifier_model,
+                    self.config.classifier_timeout_seconds,
+                    len(prompt),
+                )
                 response = await self.http_client.post(
-                    f"{self.config.ollama_base_url}/api/generate",
+                    classifier_url,
                     json=payload,
                     headers={"Content-Type": "application/json"},
                 )
+            elapsed_http = (time.perf_counter() - started) * 1000
+            LOGGER.info(
+                "Classifier HTTP complete status=%s model=%s duration=%.1fms",
+                response.status_code,
+                self.config.classifier_model,
+                elapsed_http,
+            )
             try:
                 response.raise_for_status()
             except Exception:
@@ -155,18 +169,47 @@ class VoiceRouter:
             elapsed = (time.perf_counter() - started) * 1000
             LOGGER.info("Classification decision: %s (%.1fms)", token, elapsed)
             return token
+        except TimeoutError as exc:
+            fallback = self._classifier_fallback(normalized)
+            elapsed = (time.perf_counter() - started) * 1000
+            LOGGER.warning(
+                "Classifier timeout model=%s url=%s timeout=%.2fs fallback=%s elapsed=%.1fms exc=%s",
+                self.config.classifier_model,
+                classifier_url,
+                self.config.classifier_timeout_seconds,
+                fallback,
+                elapsed,
+                type(exc).__name__,
+            )
+            LOGGER.debug("Classifier timeout traceback:\n%s", traceback.format_exc())
+            return fallback
+        except httpx.HTTPError as exc:
+            fallback = self._classifier_fallback(normalized)
+            elapsed = (time.perf_counter() - started) * 1000
+            LOGGER.warning(
+                "Classifier HTTP error model=%s url=%s fallback=%s elapsed=%.1fms error=%s",
+                self.config.classifier_model,
+                classifier_url,
+                fallback,
+                elapsed,
+                repr(exc),
+            )
+            return fallback
         except Exception as exc:
             fallback = self._classifier_fallback(normalized)
             elapsed = (time.perf_counter() - started) * 1000
             LOGGER.warning(
-                "Classifier failed, using fallback=%s (%.1fms): %s",
+                "Classifier failed model=%s fallback=%s elapsed=%.1fms error=%s",
+                self.config.classifier_model,
                 fallback,
                 elapsed,
-                exc,
+                repr(exc),
             )
+            LOGGER.debug("Classifier failure traceback:\n%s", traceback.format_exc())
             return fallback
 
     async def stream_ollama_to_piper(self, prompt: str, context: str | None = None) -> str:
+        started = time.perf_counter()
         messages: list[dict[str, str]] = []
         if context:
             messages.append(
@@ -191,10 +234,21 @@ class VoiceRouter:
             f"{self.config.ollama_base_url}/api/chat",
             json=payload,
         )
+        upstream_started = time.perf_counter()
         response = await self.http_client.send(request, stream=True)
         response.raise_for_status()
+        upstream_elapsed = (time.perf_counter() - upstream_started) * 1000
+        LOGGER.info(
+            "Voice upstream accepted status=%s model=%s context=%s in %.1fms",
+            response.status_code,
+            self.config.response_model,
+            bool(context),
+            upstream_elapsed,
+        )
 
         chunks: list[str] = []
+        chunk_count = 0
+        first_chunk_ms: float | None = None
         try:
             async for line in response.aiter_lines():
                 if not line:
@@ -208,11 +262,22 @@ class VoiceRouter:
                 chunk = str(item.get("message", {}).get("content") or "")
                 if not chunk:
                     continue
+                chunk_count += 1
+                if first_chunk_ms is None:
+                    first_chunk_ms = (time.perf_counter() - started) * 1000
+                    LOGGER.info("Voice first response chunk in %.1fms", first_chunk_ms)
                 chunks.append(chunk)
                 await self.piper_stream_chunk(chunk)
         finally:
             await response.aclose()
 
+        total_elapsed = (time.perf_counter() - started) * 1000
+        LOGGER.info(
+            "Voice stream complete chunks=%d chars=%d total=%.1fms",
+            chunk_count,
+            sum(len(c) for c in chunks),
+            total_elapsed,
+        )
         return "".join(chunks).strip()
 
     async def play_buffer_phrase(self, text: str, stop_signal: asyncio.Event) -> None:
