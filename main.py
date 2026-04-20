@@ -307,6 +307,8 @@ async def proxy_generation_request(request: Request, endpoint: str) -> Response:
             classify_elapsed,
         )
 
+        # Jon: classification in ["COMPLEX_PERSONAL", "COMPLEX_GENERAL"]:
+        # Original: classification == "COMPLEX_PERSONAL"
         if classification in ["COMPLEX_PERSONAL", "COMPLEX_GENERAL"]:
             context_started = time.perf_counter()
             try:
