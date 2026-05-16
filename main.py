@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger("ollama_proxy")
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://100.120.84.114:11434").rstrip("/")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://100.111.132.40:11434").rstrip("/")
 HINDSIGHT_HOST = os.getenv("HINDSIGHT_HOST", "http://100.111.132.40:8888").rstrip("/")
 PROXY_PORT = int(os.getenv("PROXY_PORT", "8000"))
 HINDSIGHT_MAX_MEMORIES = int(os.getenv("HINDSIGHT_MAX_MEMORIES", "5"))
